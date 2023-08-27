@@ -507,6 +507,66 @@ impl InferenceSession {
         Ok(stats)
     }
 
+    pub fn prompt_to_tokens(model: &dyn Model, prompt: &str, bos: bool, eos: bool) -> Result<Vec<TokenId>, String> {
+        let vocab = model.tokenizer();
+        let mut prompt_tokens = Prompt::from(prompt).to_tokens(
+            vocab, bos
+        ).map_err(|e| e.to_string())?;
+        if eos{
+            prompt_tokens.push(model.eot_token_id());
+        }
+        Ok(prompt_tokens)
+    }
+
+    /// 
+    pub fn feed_prompt_tokens<'a, E: std::error::Error + Send + Sync + 'static>(
+        &mut self,
+        model: &dyn Model,
+        prompt_tokens: Vec<TokenId>,
+        output_request: &mut OutputRequest,
+        mut callback: impl FnMut(&[u8]) -> Result<InferenceFeedback, E>,
+    ) -> Result<(), InferenceError> {
+        if self.n_past + prompt_tokens.len() >= model.context_size() {
+            return Err(InferenceError::ContextFull);
+        }
+
+        'outer: for batch in prompt_tokens.chunks(self.config.n_batch) {
+            model.evaluate(self, batch, output_request);
+            for &tk in batch {
+                let should_call_callback = Some(tk) != model.bot_token_id();
+
+                let mut token = match model.tokenizer() {
+                    crate::Tokenizer::Embedded(_) => model.tokenizer().token(tk as usize).to_vec(),
+                    crate::Tokenizer::HuggingFace(_) => {
+                        let mut tokens = self.tokens.clone();
+                        tokens.push(tk);
+
+                        get_newly_decoded_portion_huggingface(model, tokens, &self.decoded_tokens)
+                    }
+                };
+
+                if should_call_callback {
+                    // NOTE: No string ever tokenizes to the end of sentence. So we
+                    // can just return the id here.
+                    match callback(&token) {
+                        Err(e) => return Err(InferenceError::UserCallback(Box::new(e))),
+                        Ok(f) => match f {
+                            InferenceFeedback::Continue => (),
+                            InferenceFeedback::Halt => break 'outer,
+                        },
+                    }
+                }
+
+                // Update the tokens for this session
+                self.tokens.push(tk);
+                self.decoded_tokens.append(&mut token);
+            }
+        }
+        log::trace!("Finished feed prompt");
+
+        Ok(())
+    }
+
     /// Calculate perplexity over a given prompt, with a value reported for each
     /// chunk that has been processed.
     ///
